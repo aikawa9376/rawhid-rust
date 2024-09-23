@@ -3,6 +3,7 @@ extern crate hidapi;
 use std::{thread::sleep, time::Duration};
 
 use active_win_pos_rs::get_active_window;
+use chrono::{Datelike, Timelike, Utc};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 
 const KEY_BALL_VENDOR_ID: u16 = 0x5957;
@@ -11,14 +12,14 @@ const KEY_BALL_USAGE_ID: u16 = 0x61;
 
 enum KeyballEvent {
     ApplicationName,
-    // DatetimeUpdate,
+    DatetimeUpdate,
 }
 
 impl KeyballEvent {
     fn value(&self) -> u8 {
         match self {
             KeyballEvent::ApplicationName => 0x01,
-            // KeyballEvent::DatetimeUpdate => 0x02,
+            KeyballEvent::DatetimeUpdate => 0x02,
         }
     }
 }
@@ -75,10 +76,72 @@ fn get_device_list() {
     }
 }
 
+// 現在時刻を取得して、フォーマットされたバイト列として返す関数
+fn get_current_time_bytes() -> Vec<u8> {
+    let original = Utc::now(); // 現在のUTC時間を取得
+    let now = original + chrono::Duration::hours(7);
+
+    let time_string = format!(
+        "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    ); // YYYY:MM:DD hh:mm:ss 形式の文字列
+
+    let time_bytes = time_string.as_bytes();
+
+    // 必要な長さだけ切り取る
+    let mut time_data = vec![0x00; REPORT_LENGTH];
+    let write_length = time_bytes.len().min(REPORT_LENGTH - 1);
+    time_data[0] = KeyballEvent::DatetimeUpdate.value();
+    time_data[1..write_length + 1].copy_from_slice(&time_bytes[..write_length]);
+
+    time_data
+}
+
+// デバイスにバイト列を書き込む関数
+fn write_to_device(hid: &HidDevice, data: &[u8]) -> Result<(), String> {
+    match hid.write(data) {
+        Ok(sz) => {
+            println!("Write ({} bytes): {:?}", sz, &data[..sz]);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error writing to device: {:?}", e);
+            Err(format!("Error writing to device: {:?}", e))
+        }
+    }
+}
+
 fn start(hid: &HidDevice) -> Result<(), String> {
     let mut temp_app_name: String = String::new();
+    let mut read_buf = vec![0x00; REPORT_LENGTH]; // 読み取り用バッファ
+
+    hid.set_blocking_mode(false).unwrap();
 
     loop {
+        // まずはキーボードからの通信を確認する
+        match hid.read(&mut read_buf) {
+            Ok(bytes_read) => {
+                if bytes_read > 0 {
+                    // 先頭バイトが時刻取得だった場合、現在時刻を返す
+                    if read_buf[0] == KeyballEvent::DatetimeUpdate.value() {
+                        let time_data = get_current_time_bytes();
+                        write_to_device(hid, &time_data)?;
+                        continue; // 時刻返答が完了したので、次のループへ
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading from device: {:?}", e);
+                return Err(format!("Error reading from device: {:?}", e));
+            }
+        }
+
+        // アクティブウィンドウの情報を取得して処理する
         let app_name = get_active_window().unwrap().app_name;
 
         if temp_app_name == app_name {
@@ -94,15 +157,7 @@ fn start(hid: &HidDevice) -> Result<(), String> {
         data[0] = KeyballEvent::ApplicationName.value();
         data[1..write_length + 1].copy_from_slice(&app_name_bytes[..write_length]);
 
-        match hid.write(&data) {
-            Ok(sz) => {
-                println!("Write ({} bytes): {:?}", sz, &data[..sz]);
-            }
-            Err(e) => {
-                eprintln!("Error writing to device: {:?}", e);
-                return Err(format!("Error writing to device: {:?}", e));
-            }
-        }
+        write_to_device(hid, &data)?; // 書き込み処理を関数化
 
         sleep(Duration::from_millis(700));
     }
