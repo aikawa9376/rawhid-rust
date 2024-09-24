@@ -77,7 +77,7 @@ fn get_device_list() {
 }
 
 // 現在時刻を取得して、フォーマットされたバイト列として返す関数
-fn get_current_time_bytes() -> Vec<u8> {
+fn get_current_time_bytes(padding_byte: usize) -> Vec<u8> {
     let original = Utc::now(); // 現在のUTC時間を取得
     let now = original + chrono::Duration::hours(7);
 
@@ -95,9 +95,10 @@ fn get_current_time_bytes() -> Vec<u8> {
 
     // 必要な長さだけ切り取る
     let mut time_data = vec![0x00; REPORT_LENGTH];
-    let write_length = time_bytes.len().min(REPORT_LENGTH - 1);
-    time_data[0] = KeyballEvent::DatetimeUpdate.value();
-    time_data[1..write_length + 1].copy_from_slice(&time_bytes[..write_length]);
+    let write_length = time_bytes.len().min(REPORT_LENGTH - padding_byte);
+    time_data[padding_byte - 1] = KeyballEvent::DatetimeUpdate.value();
+    time_data[padding_byte..write_length + padding_byte]
+        .copy_from_slice(&time_bytes[..write_length]);
 
     time_data
 }
@@ -119,6 +120,7 @@ fn write_to_device(hid: &HidDevice, data: &[u8]) -> Result<(), String> {
 fn start(hid: &HidDevice) -> Result<(), String> {
     let mut temp_app_name: String = String::new();
     let mut read_buf = vec![0x00; REPORT_LENGTH]; // 読み取り用バッファ
+    let padding_byte = if cfg!(target_os = "windows") { 2 } else { 1 };
 
     hid.set_blocking_mode(false).unwrap();
 
@@ -129,7 +131,7 @@ fn start(hid: &HidDevice) -> Result<(), String> {
                 if bytes_read > 0 {
                     // 先頭バイトが時刻取得だった場合、現在時刻を返す
                     if read_buf[0] == KeyballEvent::DatetimeUpdate.value() {
-                        let time_data = get_current_time_bytes();
+                        let time_data = get_current_time_bytes(padding_byte);
                         write_to_device(hid, &time_data)?;
                         continue; // 時刻返答が完了したので、次のループへ
                     }
@@ -142,7 +144,14 @@ fn start(hid: &HidDevice) -> Result<(), String> {
         }
 
         // アクティブウィンドウの情報を取得して処理する
-        let app_name = get_active_window().unwrap().app_name;
+        // let app_name = get_active_window().unwrap().app_name;
+        let app_name = match get_active_window() {
+            Ok(active_window) => active_window.app_name,
+            Err(()) => {
+                sleep(Duration::from_millis(700));
+                continue;
+            }
+        };
 
         if temp_app_name == app_name {
             sleep(Duration::from_millis(700));
@@ -151,11 +160,12 @@ fn start(hid: &HidDevice) -> Result<(), String> {
         temp_app_name = app_name.clone();
 
         let app_name_bytes = app_name.as_bytes();
-        let write_length = app_name_bytes.len().min(REPORT_LENGTH - 1);
+        let write_length = app_name_bytes.len().min(REPORT_LENGTH - padding_byte);
 
         let mut data = vec![0x00; REPORT_LENGTH];
-        data[0] = KeyballEvent::ApplicationName.value();
-        data[1..write_length + 1].copy_from_slice(&app_name_bytes[..write_length]);
+        data[padding_byte - 1] = KeyballEvent::ApplicationName.value();
+        data[padding_byte..write_length + padding_byte]
+            .copy_from_slice(&app_name_bytes[..write_length]);
 
         write_to_device(hid, &data)?; // 書き込み処理を関数化
 
