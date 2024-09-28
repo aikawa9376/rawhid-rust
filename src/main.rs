@@ -79,7 +79,7 @@ fn get_device_list() {
 // 現在時刻を取得して、フォーマットされたバイト列として返す関数
 fn get_current_time_bytes(padding_byte: usize) -> Vec<u8> {
     let original = Utc::now(); // 現在のUTC時間を取得
-    let now = original + chrono::Duration::hours(7);
+    let now = original + chrono::Duration::hours(9);
 
     let time_string = format!(
         "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
@@ -107,6 +107,7 @@ fn get_current_time_bytes(padding_byte: usize) -> Vec<u8> {
 fn write_to_device(hid: &HidDevice, data: &[u8]) -> Result<(), String> {
     match hid.write(data) {
         Ok(sz) => {
+            let sz = sz - if cfg!(target_os = "windows") { 1 } else { 0 };
             println!("Write ({} bytes): {:?}", sz, &data[..sz]);
             Ok(())
         }
