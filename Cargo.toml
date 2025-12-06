@@ -7,3 +7,11 @@ edition = "2021"
 active-win-pos-rs = "0.8.3"
 chrono = "0.4"
 hidapi = { version = "2.6.3", features = ["linux-static-hidraw"] }
+
+[package.metadata.bundle]
+name = "RawHID Rust"
+identifier = "com.rawhid.rust"
+version = "0.1.0"
+category = "Utility"
+short_description = "RawHID Rust Application"
+long_description = "RawHID Rust Application for macOS"
