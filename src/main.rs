@@ -232,6 +232,13 @@ fn reconnect() -> Result<HidDevice, String> {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--watch-app-names") {
+        for app_name in active_window::spawn_app_name_watcher() {
+            println!("{app_name}");
+        }
+        return;
+    }
+
     match reconnect() {
         Ok(mut device) => loop {
             match start(&device) {

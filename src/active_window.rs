@@ -21,7 +21,11 @@ pub fn spawn_app_name_watcher() -> Receiver<String> {
 
 #[cfg(target_os = "linux")]
 fn watch_app_names(tx: Sender<String>) -> Result<(), String> {
-    x11::watch_app_names(tx)
+    if let Some(socket_path) = sway::socket_path() {
+        sway::watch_app_names(tx, socket_path)
+    } else {
+        x11::watch_app_names(tx)
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -51,6 +55,129 @@ fn fallback_poll_app_names(tx: Sender<String>) {
         }
 
         thread::sleep(FALLBACK_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod sway {
+    use std::{
+        fs::{read_dir, read_link},
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+        sync::mpsc::Sender,
+        thread,
+    };
+
+    use swayipc::{Connection, Event, EventType, Node, WindowChange};
+
+    pub fn socket_path() -> Option<PathBuf> {
+        if let Some(socket_path) = std::env::var_os("SWAYSOCK").filter(|value| !value.is_empty()) {
+            return Some(socket_path.into());
+        }
+
+        let sudo_uid = std::env::var("SUDO_UID").ok()?;
+        let socket_prefix = format!("sway-ipc.{sudo_uid}.");
+        let runtime_dir = PathBuf::from("/run/user").join(sudo_uid);
+
+        read_dir(runtime_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                    return false;
+                };
+
+                file_name.starts_with(&socket_prefix)
+                    && file_name.ends_with(".sock")
+                    && UnixStream::connect(path).is_ok()
+            })
+    }
+
+    pub fn watch_app_names(tx: Sender<String>, socket_path: PathBuf) -> Result<(), String> {
+        loop {
+            match watch_connection(&tx, &socket_path) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    eprintln!("Sway IPC watcher failed: {error}; retrying");
+                    thread::sleep(super::FALLBACK_POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    fn watch_connection(tx: &Sender<String>, socket_path: &Path) -> Result<(), String> {
+        let events = connect(socket_path)?
+            .subscribe([EventType::Window])
+            .map_err(|e| e.to_string())?;
+        if !send_initial_app_name(tx, socket_path)? {
+            return Ok(());
+        }
+
+        for event in events {
+            let Event::Window(event) = event.map_err(|e| e.to_string())? else {
+                continue;
+            };
+
+            if event.change != WindowChange::Focus {
+                continue;
+            }
+
+            let Some(app_name) = node_app_name(&event.container) else {
+                continue;
+            };
+
+            if tx.send(app_name).is_err() {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_initial_app_name(tx: &Sender<String>, socket_path: &Path) -> Result<bool, String> {
+        let tree = connect(socket_path)?
+            .get_tree()
+            .map_err(|e| e.to_string())?;
+        let Some(node) = tree.find_as_ref(|node| node.focused) else {
+            return Ok(true);
+        };
+        let Some(app_name) = node_app_name(node) else {
+            return Ok(true);
+        };
+
+        Ok(tx.send(app_name).is_ok())
+    }
+
+    fn connect(socket_path: &Path) -> Result<Connection, String> {
+        UnixStream::connect(socket_path)
+            .map(Connection::from)
+            .map_err(|e| e.to_string())
+    }
+
+    fn node_app_name(node: &Node) -> Option<String> {
+        node.app_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                node.window_properties
+                    .as_ref()?
+                    .class
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| process_name(node.pid?))
+    }
+
+    fn process_name(pid: i32) -> Option<String> {
+        let process_path = read_link(format!("/proc/{pid}/exe")).ok()?;
+        process_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
     }
 }
 

@@ -9,6 +9,7 @@ chrono = "0.4"
 hidapi = { version = "2.6.3", features = ["linux-static-hidraw"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+swayipc = "4.0.0"
 xcb = "1.4.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
