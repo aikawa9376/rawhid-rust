@@ -21,7 +21,9 @@ pub fn spawn_app_name_watcher() -> Receiver<String> {
 
 #[cfg(target_os = "linux")]
 fn watch_app_names(tx: Sender<String>) -> Result<(), String> {
-    if let Some(socket_path) = sway::socket_path() {
+    if let Some(socket_paths) = hyprland::socket_paths() {
+        hyprland::watch_app_names(tx, socket_paths)
+    } else if let Some(socket_path) = sway::socket_path() {
         sway::watch_app_names(tx, socket_path)
     } else {
         x11::watch_app_names(tx)
@@ -55,6 +57,218 @@ fn fallback_poll_app_names(tx: Sender<String>) {
         }
 
         thread::sleep(FALLBACK_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod hyprland {
+    use std::{
+        fs::read_dir,
+        io::{BufRead, BufReader, Read, Write},
+        os::unix::net::UnixStream,
+        path::{Path, PathBuf},
+        sync::mpsc::Sender,
+        thread,
+    };
+
+    #[derive(Debug)]
+    pub struct SocketPaths {
+        command: PathBuf,
+        events: PathBuf,
+    }
+
+    pub fn socket_paths() -> Option<SocketPaths> {
+        let runtime_dirs = runtime_dirs();
+
+        if let Some(signature) =
+            std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").filter(|value| !value.is_empty())
+        {
+            for runtime_dir in &runtime_dirs {
+                let instance_dir = runtime_dir.join("hypr").join(&signature);
+                if let Some(paths) = connected_socket_paths(instance_dir) {
+                    return Some(paths);
+                }
+            }
+        }
+
+        runtime_dirs.into_iter().find_map(|runtime_dir| {
+            read_dir(runtime_dir.join("hypr"))
+                .ok()?
+                .filter_map(Result::ok)
+                .filter_map(|entry| connected_socket_paths(entry.path()))
+                .next()
+        })
+    }
+
+    fn runtime_dirs() -> Vec<PathBuf> {
+        let mut runtime_dirs = Vec::new();
+
+        if let Some(runtime_dir) =
+            std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
+        {
+            runtime_dirs.push(runtime_dir.into());
+        }
+
+        if let Some(uid) = std::env::var_os("SUDO_UID")
+            .or_else(|| std::env::var_os("UID"))
+            .filter(|value| !value.is_empty())
+        {
+            let runtime_dir = PathBuf::from("/run/user").join(uid);
+            if !runtime_dirs.contains(&runtime_dir) {
+                runtime_dirs.push(runtime_dir);
+            }
+        }
+
+        runtime_dirs
+    }
+
+    fn connected_socket_paths(instance_dir: PathBuf) -> Option<SocketPaths> {
+        let command = instance_dir.join(".socket.sock");
+        let events = instance_dir.join(".socket2.sock");
+
+        UnixStream::connect(&events).ok()?;
+
+        Some(SocketPaths { command, events })
+    }
+
+    pub fn watch_app_names(tx: Sender<String>, socket_paths: SocketPaths) -> Result<(), String> {
+        loop {
+            match watch_connection(&tx, &socket_paths) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    eprintln!("Hyprland IPC watcher failed: {error}; retrying");
+                    thread::sleep(super::FALLBACK_POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    fn watch_connection(tx: &Sender<String>, socket_paths: &SocketPaths) -> Result<(), String> {
+        let events = UnixStream::connect(&socket_paths.events).map_err(|e| e.to_string())?;
+
+        if !send_initial_app_name(tx, &socket_paths.command)? {
+            return Ok(());
+        }
+
+        for line in BufReader::new(events).lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            if let Some(app_name) = active_window_event_app_name(&line) {
+                if tx.send(app_name.to_owned()).is_err() {
+                    return Ok(());
+                }
+            } else if let Some(app_name) = opened_layer_app_name(&line) {
+                if tx.send(app_name.to_owned()).is_err() {
+                    return Ok(());
+                }
+            } else if closed_tracked_layer(&line)
+                && !send_initial_app_name(tx, &socket_paths.command)?
+            {
+                return Ok(());
+            }
+        }
+
+        Err("event socket closed".to_string())
+    }
+
+    fn send_initial_app_name(tx: &Sender<String>, command_path: &Path) -> Result<bool, String> {
+        let response = request(command_path, b"j/activewindow")?;
+        let Some(app_name) = active_window_response_app_name(&response)? else {
+            return Ok(true);
+        };
+
+        Ok(tx.send(app_name).is_ok())
+    }
+
+    fn request(command_path: &Path, request: &[u8]) -> Result<String, String> {
+        let mut stream = UnixStream::connect(command_path).map_err(|e| e.to_string())?;
+        stream.write_all(request).map_err(|e| e.to_string())?;
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|e| e.to_string())?;
+        Ok(response)
+    }
+
+    fn active_window_response_app_name(response: &str) -> Result<Option<String>, String> {
+        let response: serde_json::Value =
+            serde_json::from_str(response).map_err(|e| e.to_string())?;
+
+        Ok(response
+            .get("class")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned))
+    }
+
+    fn active_window_event_app_name(event: &str) -> Option<&str> {
+        event
+            .strip_prefix("activewindow>>")?
+            .split_once(',')
+            .map(|(class, _title)| class)
+            .filter(|class| !class.is_empty())
+    }
+
+    fn opened_layer_app_name(event: &str) -> Option<&'static str> {
+        layer_app_name(event.strip_prefix("openlayer>>")?)
+    }
+
+    fn closed_tracked_layer(event: &str) -> bool {
+        event
+            .strip_prefix("closelayer>>")
+            .and_then(layer_app_name)
+            .is_some()
+    }
+
+    fn layer_app_name(namespace: &str) -> Option<&'static str> {
+        match namespace {
+            "rofi" => Some("Rofi"),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            active_window_event_app_name, active_window_response_app_name, closed_tracked_layer,
+            opened_layer_app_name,
+        };
+
+        #[test]
+        fn parses_active_window_response() {
+            let response = r#"{"address":"0x123","class":"vivaldi-stable","title":"Page"}"#;
+
+            assert_eq!(
+                active_window_response_app_name(response).unwrap(),
+                Some("vivaldi-stable".to_string())
+            );
+        }
+
+        #[test]
+        fn parses_active_window_event_without_treating_title_commas_as_separators() {
+            assert_eq!(
+                active_window_event_app_name("activewindow>>vivaldi-stable,One, Two"),
+                Some("vivaldi-stable")
+            );
+        }
+
+        #[test]
+        fn ignores_other_or_empty_active_window_events() {
+            assert_eq!(active_window_event_app_name("workspace>>1"), None);
+            assert_eq!(active_window_event_app_name("activewindow>>,Desktop"), None);
+        }
+
+        #[test]
+        fn maps_rofi_layer_events_to_the_firmware_application_name() {
+            assert_eq!(opened_layer_app_name("openlayer>>rofi"), Some("Rofi"));
+            assert!(closed_tracked_layer("closelayer>>rofi"));
+        }
+
+        #[test]
+        fn ignores_untracked_layer_namespaces() {
+            assert_eq!(opened_layer_app_name("openlayer>>waybar"), None);
+            assert!(!closed_tracked_layer("closelayer>>waybar"));
+        }
     }
 }
 

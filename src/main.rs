@@ -28,6 +28,15 @@ impl KeyballEvent {
 const REPORT_LENGTH: usize = 32;
 const HID_READ_TIMEOUT: i32 = 50;
 
+fn firmware_app_name(app_name: &str) -> &str {
+    match app_name {
+        // Keep compatibility with firmware builds from before the Wayland app_id
+        // was added to the CopyQ override selector.
+        "com.github.hluk.copyq" => "copyq",
+        _ => app_name,
+    }
+}
+
 fn check_device(info: &DeviceInfo) -> bool {
     info.vendor_id() == KEY_BALL_VENDOR_ID
         && info.product_id() == KEY_BALL_PRODUCT_ID
@@ -153,6 +162,8 @@ fn update_active_application_name(
     temp_app_name: &mut String,
     padding_byte: usize,
 ) -> Result<(), String> {
+    let app_name = firmware_app_name(&app_name).to_owned();
+
     if *temp_app_name == app_name {
         return Ok(());
     }
@@ -234,7 +245,7 @@ fn reconnect() -> Result<HidDevice, String> {
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--watch-app-names") {
         for app_name in active_window::spawn_app_name_watcher() {
-            println!("{app_name}");
+            println!("{}", firmware_app_name(&app_name));
         }
         return;
     }
@@ -258,5 +269,21 @@ fn main() {
         Err(e) => {
             eprintln!("Failed to connect to keyball: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::firmware_app_name;
+
+    #[test]
+    fn maps_copyq_wayland_app_id_to_legacy_firmware_name() {
+        assert_eq!(firmware_app_name("com.github.hluk.copyq"), "copyq");
+    }
+
+    #[test]
+    fn preserves_other_application_names() {
+        assert_eq!(firmware_app_name("kitty"), "kitty");
+        assert_eq!(firmware_app_name("Rofi"), "Rofi");
     }
 }
