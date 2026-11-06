@@ -2,17 +2,30 @@
 
 # macOSアプリバンドルを作成するスクリプト
 
-set -e
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "This script builds a macOS app bundle; run it on macOS." >&2
+    exit 1
+fi
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 APP_NAME="RawHID Rust"
 APP_DIR="${APP_NAME}.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+BUILD_TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+case "${BUILD_TARGET}" in
+    *-apple-darwin) ;;
+    *) echo "A macOS Rust target is required: ${BUILD_TARGET}" >&2; exit 1 ;;
+esac
 
-# クリーンビルド
+# リリースビルド
 echo "Building Rust application..."
-cargo build --release
+cargo build --release --locked --target "${BUILD_TARGET}" --target-dir "${BUILD_TARGET_DIR}"
 
 # アプリバンドルディレクトリを作成
 echo "Creating app bundle structure..."
@@ -22,7 +35,7 @@ mkdir -p "${RESOURCES_DIR}"
 
 # バイナリをコピー
 echo "Copying binary..."
-cp target/release/rawhid-rust "${MACOS_DIR}/${APP_NAME}"
+cp "${BUILD_TARGET_DIR}/${BUILD_TARGET}/release/rawhid-rust" "${MACOS_DIR}/${APP_NAME}"
 
 # Info.plistを作成
 echo "Creating Info.plist..."
@@ -51,8 +64,6 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2024</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>このアプリはアクティブなアプリケーション名を取得するためにアクセシビリティ権限が必要です。</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <key>LSUIElement</key>
@@ -66,7 +77,5 @@ chmod +x "${MACOS_DIR}/${APP_NAME}"
 
 echo "App bundle created: ${APP_DIR}"
 echo ""
-echo "次の手順でアクセシビリティ権限を付与してください:"
-echo "1. ${APP_DIR} を Applications フォルダに移動"
-echo "2. システム設定 > プライバシーとセキュリティ > アクセシビリティ"
-echo "3. ${APP_NAME} を追加してチェックを入れる"
+echo "${APP_DIR} を Applications フォルダに移動して起動してください。"
+echo "アプリ名の取得に画面収録・アクセシビリティ権限は不要です。"

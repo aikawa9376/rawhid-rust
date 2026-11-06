@@ -5,10 +5,27 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4"
-hidapi = "2.6.3"
-objc = "0.2"
-core-graphics = "0.23"
-core-foundation = "0.9"
+hidapi = { version = "2.6.3", features = ["linux-static-hidraw"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+serde_json = "1.0"
+swayipc = "4.0.0"
+xcb = "1.4.0"
+
+[target.'cfg(not(any(target_os = "linux", target_os = "macos")))'.dependencies]
+active-win-pos-rs = "0.8.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSDate", "NSDictionary", "NSNotification", "NSObjCRuntime", "NSOperation", "NSRunLoop", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.48.0", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [package.metadata.bundle]
 name = "RawHID Rust"
