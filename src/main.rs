@@ -1,289 +1,377 @@
-extern crate hidapi;
-
-use std::{sync::mpsc::Receiver, thread::sleep, time::Duration};
+use std::{
+    sync::mpsc::{Receiver, SyncSender},
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use chrono::{Datelike, Timelike, Utc};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 
 mod active_window;
+mod clipboard;
+mod protocol;
+use protocol::*;
 
-const KEY_BALL_VENDOR_ID: u16 = 0x5957;
-const KEY_BALL_PRODUCT_ID: u16 = 0x0200;
-const KEY_BALL_USAGE_ID: u16 = 0x61;
-
-enum KeyballEvent {
-    ApplicationName,
-    DatetimeUpdate,
-}
-
-impl KeyballEvent {
-    fn value(&self) -> u8 {
-        match self {
-            KeyballEvent::ApplicationName => 0x01,
-            KeyballEvent::DatetimeUpdate => 0x02,
-        }
-    }
-}
-
-const REPORT_LENGTH: usize = 32;
-const HID_READ_TIMEOUT: i32 = 50;
+const APP_REFRESH: Duration = Duration::from_secs(1);
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3);
+const HID_READ_TIMEOUT: i32 = 20;
 
 fn firmware_app_name(app_name: &str) -> &str {
     match app_name {
-        // Keep compatibility with firmware builds from before the Wayland app_id
-        // was added to the CopyQ override selector.
         "com.github.hluk.copyq" => "copyq",
         _ => app_name,
     }
 }
 
 fn check_device(info: &DeviceInfo) -> bool {
-    info.vendor_id() == KEY_BALL_VENDOR_ID
-        && info.product_id() == KEY_BALL_PRODUCT_ID
-        && info.usage() == KEY_BALL_USAGE_ID
+    info.vendor_id() == 0x5957
+        && info.product_id() == 0x0200
+        && info.usage_page() == 0xff60
+        && info.usage() == 0x61
 }
 
-#[allow(dead_code)]
-fn get_device_list() {
-    match HidApi::new() {
-        Ok(api) => {
-            let mut devs: Vec<_> = api.device_list().collect();
-            devs.sort_by_key(|d| d.product_id());
-            devs.sort_by_key(|d| d.vendor_id());
-            for device in devs {
-                println!(
-                    "PID:{:04X}_VID:{:04X}&UP:{:04X}_U:{:04X}",
-                    device.vendor_id(),
-                    device.product_id(),
-                    device.usage_page(),
-                    device.usage()
-                );
-                if let Ok(hid) = device.open_device(&api) {
-                    if let Ok(man) = hid.get_manufacturer_string() {
-                        println!("  manufacturer: {}", man.unwrap());
-                    } else {
-                        println!("  failed to get manufacturer");
-                    }
-                    if let Ok(prd) = hid.get_product_string() {
-                        println!("  product name: {}", prd.unwrap());
-                    } else {
-                        println!("  failed to get product name");
-                    }
-                    // try `let...else...` statement
-                    let Ok(sn) = hid.get_serial_number_string() else {
-                        println!("  failed to get serial number");
-                        continue;
-                    };
-                    println!("  serial number: {}", sn.unwrap());
-                } else {
-                    println!("  it cannot be opened");
-                    continue;
-                }
-            }
+#[derive(Default)]
+struct AppSync {
+    latest: Option<String>,
+    sent: Option<String>,
+    last_sent: Option<Instant>,
+}
+
+impl AppSync {
+    fn drain(&mut self, receiver: &Receiver<String>) {
+        // Only the latest focus matters; do not replay the disconnected PC's history.
+        while let Ok(name) = receiver.try_recv() {
+            self.latest = Some(firmware_app_name(&name).to_owned());
         }
-        Err(e) => {
-            eprintln!("Error: {}", e);
+    }
+
+    fn connected(&mut self) {
+        self.sent = None;
+        self.last_sent = None;
+    }
+
+    fn pending(&self, now: Instant) -> Option<&str> {
+        let name = self.latest.as_deref()?;
+        if self.sent.as_deref() != Some(name)
+            || self
+                .last_sent
+                .is_none_or(|sent| now.duration_since(sent) >= APP_REFRESH)
+        {
+            Some(name)
+        } else {
+            None
         }
+    }
+
+    fn mark_sent(&mut self, now: Instant) {
+        self.sent.clone_from(&self.latest);
+        self.last_sent = Some(now);
     }
 }
 
-fn report_padding_byte() -> usize {
-    if cfg!(target_os = "windows") {
-        2
-    } else {
-        1
+fn write_to_device(hid: &HidDevice, report: &Report) -> Result<(), String> {
+    let output = output_report(report);
+    let written = hid
+        .write(&output)
+        .map_err(|e| format!("HID write failed: {e}"))?;
+    if written != output.len() {
+        return Err(format!("short HID write: {written}/{}", output.len()));
     }
+    Ok(())
 }
 
-fn build_report(event: KeyballEvent, payload: &[u8], padding_byte: usize) -> [u8; REPORT_LENGTH] {
-    let mut report = [0x00; REPORT_LENGTH];
-    let write_length = payload.len().min(REPORT_LENGTH - padding_byte);
-
-    report[padding_byte - 1] = event.value();
-    report[padding_byte..write_length + padding_byte].copy_from_slice(&payload[..write_length]);
-
-    report
-}
-
-// 現在時刻を取得して、フォーマットされたバイト列として返す関数
-fn get_current_time_bytes(padding_byte: usize) -> [u8; REPORT_LENGTH] {
-    let original = Utc::now(); // 現在のUTC時間を取得
-    let now = original + chrono::Duration::hours(9);
-
-    let time_string = format!(
-        "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
-        now.year(),
-        now.month(),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    ); // YYYY:MM:DD hh:mm:ss 形式の文字列
-
-    build_report(
-        KeyballEvent::DatetimeUpdate,
-        time_string.as_bytes(),
-        padding_byte,
+fn get_current_time_report() -> Report {
+    let now = Utc::now() + chrono::Duration::hours(9);
+    text_report(
+        DATETIME_UPDATE,
+        &format!(
+            "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+            now.year(),
+            now.month(),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        ),
     )
 }
 
-// デバイスにバイト列を書き込む関数
-fn write_to_device(hid: &HidDevice, data: &[u8]) -> Result<(), String> {
-    match hid.write(data) {
-        Ok(sz) => {
-            let sz = sz.saturating_sub(if cfg!(target_os = "windows") { 1 } else { 0 });
-            println!("Write ({} bytes): {:?}", sz, &data[..sz]);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Error writing to device: {:?}", e);
-            Err(format!("Error writing to device: {:?}", e))
-        }
-    }
+#[derive(Default)]
+struct ClipboardSession {
+    transfer: TextTransfer,
+    started: Option<Instant>,
+    job: Option<(u8, bool)>,
 }
 
-fn handle_keyboard_report(
-    hid: &HidDevice,
-    read_buf: &[u8],
-    padding_byte: usize,
-) -> Result<(), String> {
-    // 先頭バイトが時刻取得だった場合、現在時刻を返す
-    if read_buf.first().copied() == Some(KeyballEvent::DatetimeUpdate.value()) {
-        let time_data = get_current_time_bytes(padding_byte);
-        write_to_device(hid, &time_data)?;
+impl ClipboardSession {
+    fn accepts(&self, completion: &clipboard::Completion, generation: u64) -> bool {
+        completion.generation == generation
+            && self.job == Some((completion.token, completion.writing))
     }
 
-    Ok(())
-}
-
-fn update_active_application_name(
-    hid: &HidDevice,
-    app_name: String,
-    temp_app_name: &mut String,
-    padding_byte: usize,
-) -> Result<(), String> {
-    let app_name = firmware_app_name(&app_name).to_owned();
-
-    if *temp_app_name == app_name {
-        return Ok(());
-    }
-
-    let data = build_report(
-        KeyballEvent::ApplicationName,
-        app_name.as_bytes(),
-        padding_byte,
-    );
-    write_to_device(hid, &data)?;
-
-    *temp_app_name = app_name;
-    Ok(())
-}
-
-fn start(hid: &HidDevice) -> Result<(), String> {
-    let mut temp_app_name: String = String::new();
-    let mut read_buf = [0x00; REPORT_LENGTH]; // 読み取り用バッファ
-    let padding_byte = report_padding_byte();
-    let app_name_rx = active_window::spawn_app_name_watcher();
-
-    loop {
-        // キーボードからの通信は hidapi 側の poll/read_timeout に任せる
-        match hid.read_timeout(&mut read_buf, HID_READ_TIMEOUT) {
-            Ok(bytes_read) if bytes_read > 0 => {
-                handle_keyboard_report(hid, &read_buf[..bytes_read], padding_byte)?;
+    fn receive(&mut self, packet: &Report, generation: u64, jobs: &SyncSender<clipboard::Job>) {
+        let token = packet[1];
+        let result = match packet[0] {
+            STORE_REQUEST => {
+                self.transfer = TextTransfer::default();
+                self.started = Some(Instant::now());
+                self.job = Some((token, false));
+                jobs.try_send(clipboard::Job {
+                    generation,
+                    token,
+                    text: None,
+                })
+                .map_err(|_| "clipboard helper is busy".to_string())
             }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error reading from device: {:?}", e);
-                return Err(format!("Error reading from device: {:?}", e));
+            PASTE_BEGIN | PASTE_DATA | PASTE_COMMIT => {
+                if packet[0] == PASTE_BEGIN {
+                    self.started = Some(Instant::now());
+                    self.job = None;
+                }
+                match self.transfer.receive(packet) {
+                    Ok(Some(text)) => {
+                        self.job = Some((token, true));
+                        jobs.try_send(clipboard::Job {
+                            generation,
+                            token,
+                            text: Some(text),
+                        })
+                        .map_err(|_| "clipboard helper is busy".to_string())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            STORE_STATUS => {
+                if self.job == Some((token, false)) {
+                    eprintln!(
+                        "Keyboard clipboard store: {}",
+                        if packet[2] == 0 { "saved" } else { "rejected" }
+                    );
+                    *self = Self::default();
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            eprintln!("Clipboard: {error}");
+            *self = Self::default();
+        }
+    }
+
+    fn finish(
+        &mut self,
+        hid: &HidDevice,
+        completion: clipboard::Completion,
+        generation: u64,
+    ) -> Result<(), String> {
+        if !self.accepts(&completion, generation) {
+            return Ok(());
+        }
+        let token = completion.token;
+        match completion.result {
+            Ok(_) if completion.writing => {
+                write_to_device(hid, &report(PASTE_READY, &[token, 0]))?;
+                *self = Self::default();
+            }
+            Ok(text) => match clipboard_text(&text) {
+                Ok(text) => {
+                    for packet in store_reports(token, &text) {
+                        write_to_device(hid, &packet)?;
+                    }
+                    eprintln!(
+                        "Keyboard clipboard: sent {} code points; awaiting confirmation",
+                        text.chars().count()
+                    );
+                }
+                Err(error) => {
+                    eprintln!("Clipboard: {error}");
+                    *self = Self::default();
+                }
+            },
+            Err(error) => {
+                eprintln!("Clipboard: {error}");
+                if completion.writing {
+                    write_to_device(hid, &report(PASTE_READY, &[token, 1]))?;
+                }
+                *self = Self::default();
             }
         }
+        Ok(())
+    }
 
-        drain_active_application_names(hid, &app_name_rx, &mut temp_app_name, padding_byte)?;
+    fn expire(&mut self) {
+        if self
+            .started
+            .is_some_and(|started| started.elapsed() >= TRANSFER_TIMEOUT)
+        {
+            eprintln!("Clipboard transfer timed out; previous stored text is retained");
+            *self = Self::default();
+        }
     }
 }
 
-fn drain_active_application_names(
+fn start(
     hid: &HidDevice,
-    app_name_rx: &Receiver<String>,
-    temp_app_name: &mut String,
-    padding_byte: usize,
+    names: &Receiver<String>,
+    apps: &mut AppSync,
+    jobs: &SyncSender<clipboard::Job>,
+    completions: &Receiver<clipboard::Completion>,
+    generation: u64,
 ) -> Result<(), String> {
-    while let Ok(app_name) = app_name_rx.try_recv() {
-        update_active_application_name(hid, app_name, temp_app_name, padding_byte)?;
+    let mut clipboard = ClipboardSession::default();
+    let mut read_buf = [0; REPORT_LENGTH];
+    apps.connected();
+    loop {
+        apps.drain(names);
+        let now = Instant::now();
+        if let Some(name) = apps.pending(now) {
+            write_to_device(hid, &text_report(APPLICATION_NAME, name))?;
+            if apps.sent.as_deref() != Some(name) {
+                eprintln!("Active application: {name}");
+            }
+            apps.mark_sent(now);
+        }
+        clipboard.expire();
+        while let Ok(completion) = completions.try_recv() {
+            clipboard.finish(hid, completion, generation)?;
+        }
+        let size = hid
+            .read_timeout(&mut read_buf, HID_READ_TIMEOUT)
+            .map_err(|e| format!("HID read failed: {e}"))?;
+        if size != REPORT_LENGTH {
+            continue;
+        }
+        if read_buf[0] == DATETIME_UPDATE {
+            write_to_device(hid, &get_current_time_report())?;
+        } else {
+            clipboard.receive(&read_buf, generation, jobs);
+        }
     }
-
-    Ok(())
 }
 
-fn reconnect() -> Result<HidDevice, String> {
+fn reconnect(names: &Receiver<String>, apps: &mut AppSync) -> HidDevice {
+    let mut attempts = 0;
     loop {
-        // デバイスリストを最新の状態で取得
+        apps.drain(names);
         match HidApi::new() {
             Ok(api) => {
-                for info in api.device_list() {
-                    if check_device(info) {
-                        println!("Reconnecting to keyball...");
-                        match info.open_device(&api) {
-                            Ok(hid) => return Ok(hid),
-                            Err(e) => {
-                                println!("Error opening keyball: {:?}", e);
-                            }
+                for info in api.device_list().filter(|info| check_device(info)) {
+                    match info.open_device(&api) {
+                        Ok(hid) => {
+                            eprintln!("Connected to Keyball");
+                            return hid;
                         }
+                        Err(error) if attempts % 10 == 0 => {
+                            eprintln!("Cannot open Keyball: {error}")
+                        }
+                        Err(_) => {}
                     }
                 }
-                println!("Keyball not found. Retrying in 3 seconds...");
             }
-            Err(e) => {
-                eprintln!("Error initializing HID API: {:?}", e);
-                return Err(format!("Error initializing HID API: {:?}", e));
-            }
+            Err(error) if attempts % 10 == 0 => eprintln!("Cannot initialize HID API: {error}"),
+            Err(_) => {}
         }
-        sleep(Duration::from_secs(3)); // 再接続を3秒ごとに試みる
+        if attempts % 10 == 0 {
+            eprintln!("Waiting for Keyball (retry every 500 ms)");
+        }
+        attempts += 1;
+        sleep(RECONNECT_INTERVAL);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn single_instance() -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixListener},
+    };
+    UnixListener::bind_addr(&SocketAddr::from_abstract_name(
+        b"rawhid-rust-keyball-5957-0200",
+    )?)
 }
 
 fn main() {
+    let names = active_window::spawn_app_name_watcher();
     if std::env::args().nth(1).as_deref() == Some("--watch-app-names") {
-        for app_name in active_window::spawn_app_name_watcher() {
-            println!("{}", firmware_app_name(&app_name));
+        for name in names {
+            println!("{}", firmware_app_name(&name));
         }
         return;
     }
-
-    match reconnect() {
-        Ok(mut device) => loop {
-            match start(&device) {
-                Ok(_) => {}
-                Err(_) => {
-                    println!("Attempting to reconnect...");
-                    match reconnect() {
-                        Ok(hid) => device = hid,
-                        Err(e) => {
-                            eprintln!("Failed to reconnect: {}", e);
-                            return;
-                        }
-                    };
-                }
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to connect to keyball: {}", e);
+    #[cfg(target_os = "linux")]
+    let _instance = match single_instance() {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("Cannot start Keyball daemon (another instance may be running): {error}");
+            std::process::exit(1);
         }
+    };
+    let (jobs, completions) = clipboard::worker();
+    let mut apps = AppSync::default();
+    let mut generation = 0;
+    loop {
+        let device = reconnect(&names, &mut apps);
+        generation += 1;
+        if let Err(error) = start(&device, &names, &mut apps, &jobs, &completions, generation) {
+            eprintln!("{error}; reconnecting");
+        }
+        drop(device);
+        sleep(RECONNECT_INTERVAL);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::firmware_app_name;
-
+    use super::*;
     #[test]
-    fn maps_copyq_wayland_app_id_to_legacy_firmware_name() {
-        assert_eq!(firmware_app_name("com.github.hluk.copyq"), "copyq");
+    fn kvm_return_resends_unchanged_application_and_coalesces_focus_history() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut apps = AppSync::default();
+        let now = Instant::now();
+        tx.send("kitty".into()).unwrap();
+        tx.send("com.github.hluk.copyq".into()).unwrap();
+        apps.drain(&rx);
+        assert_eq!(apps.pending(now), Some("copyq"));
+        apps.mark_sent(now);
+        assert_eq!(apps.pending(now + Duration::from_millis(900)), None);
+        assert_eq!(apps.pending(now + APP_REFRESH), Some("copyq"));
+        apps.connected();
+        assert_eq!(apps.pending(now), Some("copyq"));
     }
 
     #[test]
-    fn preserves_other_application_names() {
+    fn ignores_clipboard_completions_from_a_previous_usb_connection_or_request() {
+        let session = ClipboardSession {
+            job: Some((9, true)),
+            ..Default::default()
+        };
+        let mut completion = clipboard::Completion {
+            generation: 1,
+            token: 9,
+            writing: true,
+            result: Ok(String::new()),
+        };
+        assert!(!session.accepts(&completion, 2));
+        completion.generation = 2;
+        assert!(session.accepts(&completion, 2));
+        completion.token = 8;
+        assert!(!session.accepts(&completion, 2));
+        completion.token = 9;
+        completion.writing = false;
+        assert!(!session.accepts(&completion, 2));
+    }
+
+    #[test]
+    fn failed_write_is_still_pending() {
+        let apps = AppSync {
+            latest: Some("Rofi".into()),
+            ..Default::default()
+        };
+        assert_eq!(apps.pending(Instant::now()), Some("Rofi"));
+        assert_eq!(apps.pending(Instant::now()), Some("Rofi"));
         assert_eq!(firmware_app_name("kitty"), "kitty");
-        assert_eq!(firmware_app_name("Rofi"), "Rofi");
     }
 }

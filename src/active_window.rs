@@ -10,10 +10,18 @@ pub fn spawn_app_name_watcher() -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        if let Err(e) = watch_app_names(tx.clone()) {
-            eprintln!("active window watcher failed: {e}");
-            fallback_poll_app_names(tx);
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        loop {
+            match watch_app_names(tx.clone()) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("active window watcher failed: {error}; reconnecting");
+                    thread::sleep(FALLBACK_POLL_INTERVAL);
+                }
+            }
         }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        fallback_poll_app_names(tx);
     });
 
     rx
@@ -36,10 +44,6 @@ fn watch_app_names(tx: Sender<String>) -> Result<(), String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-fn watch_app_names(_tx: Sender<String>) -> Result<(), String> {
-    Err("active window events are not implemented on this platform".to_string())
-}
-
 fn fallback_poll_app_names(tx: Sender<String>) {
     let mut last_app_name = String::new();
 
@@ -181,6 +185,12 @@ mod hyprland {
 
     fn request(command_path: &Path, request: &[u8]) -> Result<String, String> {
         let mut stream = UnixStream::connect(command_path).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+            .map_err(|e| e.to_string())?;
         stream.write_all(request).map_err(|e| e.to_string())?;
 
         let mut response = String::new();
@@ -346,7 +356,7 @@ mod sway {
             }
         }
 
-        Ok(())
+        Err("Sway event socket closed".to_string())
     }
 
     fn send_initial_app_name(tx: &Sender<String>, socket_path: &Path) -> Result<bool, String> {
@@ -426,7 +436,8 @@ mod x11 {
             let _ = tx.send(app_name);
         }
 
-        while let Ok(event) = conn.wait_for_event() {
+        loop {
+            let event = conn.wait_for_event().map_err(|e| e.to_string())?;
             let xcb::Event::X(x::Event::PropertyNotify(event)) = event else {
                 continue;
             };
@@ -441,11 +452,9 @@ mod x11 {
             };
 
             if tx.send(app_name).is_err() {
-                break;
+                return Ok(());
             }
         }
-
-        Ok(())
     }
 
     fn current_app_name(
@@ -558,8 +567,6 @@ mod win {
             *app_name_tx = Some(tx);
         }
 
-        send_current_app_name();
-
         let hook = unsafe {
             SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
@@ -576,6 +583,7 @@ mod win {
             return Err("SetWinEventHook failed".to_string());
         }
 
+        send_current_app_name();
         let result = message_loop();
 
         unsafe {
